@@ -63,11 +63,16 @@ class State:
     episode_number: int = 0
     task_index: int = 0
     task_title: str = ""
+    arm_status_right: str = "stopped"
+    arm_status_left: str = "stopped"
 
 
 state = State()
 
 _state_changed = asyncio.Condition()
+
+# Monotonically incremented on every state change.
+state_version = 0
 
 
 CAMERA_INPUTS = (
@@ -80,6 +85,9 @@ CAMERA_INPUTS = (
 
 CAMERA_TIMESTAMP_WINDOW = 60
 CAMERA_STALE_AFTER_S = 1.0
+
+# dora-openarm status inputs, one per arm. The input id matches the State field
+ARM_STATUS_INPUTS = ("arm_status_right", "arm_status_left")
 
 
 @dataclasses.dataclass
@@ -126,7 +134,9 @@ def _update_camera_stats(event_id: str, ts_s: float) -> None:
 
 
 async def _notify_state_changed() -> None:
+    global state_version
     async with _state_changed:
+        state_version += 1
         _state_changed.notify_all()
 
 
@@ -173,11 +183,23 @@ def _command_quit():
     state.running = False
 
 
+def _command_arm_start():
+    """Start (power on) the arm(s)."""
+    node.send_output("arm_command", pa.array(["start"]))
+
+
+def _command_arm_stop():
+    """Pause (stop) the arm(s)."""
+    node.send_output("arm_command", pa.array(["stop"]))
+
+
 @app.get("/", response_class=HTMLResponse)
 def _root(request: Request):
     """Render the main HTML."""
     return templates.TemplateResponse(
-        request=request, name="root.html", context={"state": state}
+        request=request,
+        name="root.html",
+        context={"state": state, "state_version": state_version},
     )
 
 
@@ -216,16 +238,28 @@ def _cancel(request: Request):
 
 
 @app.get("/events", response_class=EventSourceResponse)
-async def _events() -> AsyncIterable[ServerSentEvent]:
+async def _events(request: Request) -> AsyncIterable[ServerSentEvent]:
+    try:
+        last_version = int(request.query_params.get("since"))
+    except (TypeError, ValueError):
+        last_version = state_version
     while state.running:
         async with _state_changed:
-            await _state_changed.wait()
+            await _state_changed.wait_for(
+                lambda: state_version != last_version or not state.running
+            )
+        if not state.running:
+            break
+        last_version = state_version
         yield ServerSentEvent(
             data={
                 "collecting": state.collecting,
                 "episode_number": state.episode_number,
                 "task_index": state.task_index,
-            }
+                "arm_status_right": state.arm_status_right,
+                "arm_status_left": state.arm_status_left,
+            },
+            id=str(state_version),
         )
 
 
@@ -251,6 +285,20 @@ def _quit(request: Request):
     return RedirectResponse(request.url_for("_root"), 303)
 
 
+@app.post("/arm/start")
+def _arm_start(request: Request):
+    """Start (power on) the arm(s)."""
+    _command_arm_start()
+    return RedirectResponse(request.url_for("_root"), 303)
+
+
+@app.post("/arm/stop")
+def _arm_stop(request: Request):
+    """Pause (stop) the arm(s)."""
+    _command_arm_stop()
+    return RedirectResponse(request.url_for("_root"), 303)
+
+
 def load_yaml(path):
     """Load a YAML file."""
     with open(path) as f:
@@ -263,6 +311,8 @@ async def _main_uvicorn(server):
 
 async def _main_dora(server):
     """Quit the Web application when this dataflow is stopped."""
+    # Bring the arm(s) up on boot. dora-openarm no longer auto-starts
+    _command_arm_start()
     last_values = {}
     while state.running:
         if node.is_empty():
@@ -278,6 +328,13 @@ async def _main_dora(server):
                     event_id,
                     _event_ts_to_seconds(event["metadata"].get("timestamp")),
                 )
+                continue
+            if event_id in ARM_STATUS_INPUTS:
+                value = event["value"][0].as_py()
+                # Only notify on an actual change. The follower may publish repeated (heartbeat) status values;
+                if getattr(state, event_id) != value:
+                    setattr(state, event_id, value)
+                    await _notify_state_changed()
                 continue
             if event_id not in ("button_a", "button_b"):
                 continue
