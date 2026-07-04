@@ -174,6 +174,26 @@ async def _notify_state_changed() -> None:
         _state_changed.notify_all()
 
 
+def _next_episode_number(directory: pathlib.Path, dataset_name: str) -> int:
+    """Read an existing dataset and return the next free episode id."""
+    metadata_path = directory / dataset_name / "metadata.yaml"
+    episodes_dir = directory / dataset_name / "episodes"
+    ids: set[int] = set()
+    if metadata_path.is_file():
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = yaml.safe_load(f) or {}
+        for episode in metadata.get("episodes", []):
+            try:
+                ids.add(int(episode["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if episodes_dir.is_dir():
+        for path in episodes_dir.iterdir():
+            if path.is_dir() and path.name.isdigit():
+                ids.add(int(path.name))
+    return max(ids, default=-1) + 1
+
+
 def next_task():
     """Update the state with the next task."""
     state.task_index += 1
@@ -440,6 +460,18 @@ def main():
         type=pathlib.Path,
     )
     parser.add_argument(
+        "--directory",
+        default=os.getenv("DIRECTORY", os.getcwd()),
+        help="Dataset output directory (same as recorder DIRECTORY)",
+        type=pathlib.Path,
+    )
+    parser.add_argument(
+        "--dataset-name",
+        default=os.getenv("NAME", "dataset"),
+        help="Dataset name (same as recorder NAME)",
+        type=str,
+    )
+    parser.add_argument(
         "--auto-open",
         action=argparse.BooleanOptionalAction,
         default=os.getenv("AUTO_OPEN", "") == "yes",
@@ -460,6 +492,7 @@ def main():
     metadata = load_yaml(args.metadata_file)
     tasks = metadata["tasks"]
     state.task_title = tasks[state.task_index]["prompt"]
+    state.episode_number = _next_episode_number(args.directory, args.dataset_name)
 
     node = dora.Node()
     asyncio.run(_main_async())
