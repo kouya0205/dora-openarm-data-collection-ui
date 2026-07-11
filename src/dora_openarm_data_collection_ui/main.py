@@ -33,6 +33,11 @@ import time
 import uvicorn
 import yaml
 
+from dora_openarm_data_collection_ui.dataset_naming import (
+    parse_resume_flag,
+    resolve_dataset_name,
+)
+
 base_dir = os.path.dirname(__file__)
 templates = Jinja2Templates(directory=f"{base_dir}/templates")
 
@@ -131,7 +136,11 @@ async def _notify_state_changed() -> None:
 
 
 def _next_episode_number(directory: pathlib.Path, dataset_name: str) -> int:
-    """Read an existing dataset and return the next free episode id."""
+    """Read an existing dataset and return the next free episode id.
+
+    For a newly created versioned dataset the folder may not exist yet, in which
+    case recording starts at episode 0.
+    """
     metadata_path = directory / dataset_name / "metadata.yaml"
     episodes_dir = directory / dataset_name / "episodes"
     ids: set[int] = set()
@@ -360,8 +369,14 @@ def main():
     parser.add_argument(
         "--dataset-name",
         default=os.getenv("NAME", "dataset"),
-        help="Dataset name (same as recorder NAME)",
+        help="Short dataset base name (resolved to {base}_v{N}) or exact versioned name",
         type=str,
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=parse_resume_flag(os.getenv("RESUME")),
+        help="Append to the latest (or exact) dataset version instead of creating a new one",
     )
     parser.add_argument(
         "--auto-open",
@@ -384,7 +399,16 @@ def main():
     metadata = load_yaml(args.metadata_file)
     tasks = metadata["tasks"]
     state.task_title = tasks[state.task_index]["prompt"]
-    state.episode_number = _next_episode_number(args.directory, args.dataset_name)
+
+    resolved_name = resolve_dataset_name(
+        args.directory, args.dataset_name, resume=args.resume
+    )
+    mode = "resume" if args.resume else "create"
+    print(
+        f"[dataset] mode={mode} base={args.dataset_name!r} -> "
+        f"{args.directory / resolved_name}"
+    )
+    state.episode_number = _next_episode_number(args.directory, resolved_name)
 
     node = dora.Node()
     asyncio.run(_main_async())
